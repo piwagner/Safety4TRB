@@ -1,0 +1,504 @@
+---
+title: A smart data approach to traffic safety 
+runninghead: Wagner \emph{et al}.
+author:
+- name: A. Leich
+  num: 1
+- name: R. Nippold
+  num: 1
+- name: P. Wagner*
+  num: 1, 2
+address:
+- num: 1
+  org: Institute of Transport Systems, German Aerospace Center, Rutherfordstrasse 2, 12489 Berlin, Germany
+- num: 2
+  org: Institute of Land- and Sea Transport Systems, Technical University of Berlin, Salzufer 17-19, 10587 Berlin, Germany
+corrauth: "Peter Wagner"
+email: peter.wagner@dlr.de
+abstract: "This work demonstrates, how a large data-base of traffic crashes can be used to analyze ensemble data. It fused data from the German Unfallatlas (German Crash Database - GCDB) with Open Streetmap data (both publicly available), and a data-base from the German Federal State Northrhine-Westfalia (NW) named NWSIB that provides additional information about each intersection, most importantly an estimate of the ADT-values at each intersection. The results have to be taken with care, since the quality of the ADT's in the data-base is hard to control, and because this approach may have assignment errors. 
+  The results partially reproduce known findings; however, they allow in principle for a more detailed investigation of the relationship between crash-numbers and ADT-values than is possible with generalized linear models (glm). 
+  In line with the call, all the data, as well as the scripts that analyse the data are publicly available -- this text is entirely written in the Rmd format [@RStudio2022], and most computations have been done in R [@R2021] and QGIS [@QGIS]."
+keywords: Traffic safety; intersections; crash-rate;
+classoption:
+  - Royal
+  - times
+bibliography: TRB2023sage
+bibliographystyle: sagev
+output:
+  rticles::sage_article:
+    keep_tex: yes
+---
+
+```{r setup, include=FALSE}
+# Sets-up anything, and defines a few functions and a 
+# few parameters needed later on
+knitr::opts_chunk$set(echo = FALSE, warning=FALSE)
+knitr::opts_chunk$set(cache = TRUE)
+library(readxl)
+library(MASS)
+library(interactions)
+library(mgcv)
+library(ggplot2)
+library(boot)
+
+theme_set(theme_minimal(base_size=16)) # for ggplot()
+
+mSum = function(x) sum(x,na.rm=T)
+mMax = function(x) max(x,na.rm=T)
+mMin = function(x) min(x,na.rm=T)
+mMean = function(x) mean(x,na.rm=T)
+qMx = 65000
+
+# Divide q-values into percentiles, and compute mean-value there:
+# instead of the means: compute bands around the means
+myAgg = function(rY, nInt=11, qMax=1e6) {
+  yy = subset(rY, qCarMax<qMax)
+  iQ = quantile(yy$qCarMax, prob=seq(0,1,length.out=nInt), na.rm=T)
+  yy$iQ = cut(yy$qCarMax, breaks=iQ)
+  qM = 0.5*(iQ[1:(nInt-1)] + iQ[2:nInt])
+  zz = aggregate(N ~ iQ, data=yy, FUN=mean)
+  zz1 = aggregate(N ~ iQ, data=yy, FUN=length)
+  zz$qM = qM
+  zz$n = zz1$N
+  return(zz)
+}
+
+myAggBike = function(rY, nInt=11, qMax=1e6) {
+  yy = subset(rY, qBike<qMax)
+  iQ = quantile(yy$qBike, prob=seq(0,1,length.out=nInt), na.rm=T)
+  yy$iQ = cut(yy$qBike, breaks=iQ)
+  qM = 0.5*(iQ[1:(nInt-1)] + iQ[2:nInt])
+  zz = aggregate(isBike ~ iQ, data=yy, FUN=mean)
+  zz1 = aggregate(isBike ~ iQ, data=yy, FUN=length)
+  zz$qM = qM
+  zz$n = zz1$N
+  return(zz)
+}
+
+myAggG = function(qQ, nN, nInt=11, qMax=1e6, rR=200) {
+  rY = data.frame(Q=qQ, N=nN)
+  yy = subset(rY, Q<qMax)
+  iQ = quantile(yy$Q, prob=seq(0,1,length.out=nInt), na.rm=T)
+  yy$iQ = cut(yy$Q, breaks=iQ)
+  ll = levels(yy$iQ)
+  qM = 0.5*(iQ[1:(nInt-1)] + iQ[2:nInt])
+  zz = aggregate(N ~ iQ, data=yy, FUN=mean)
+  zz1 = aggregate(N ~ iQ, data=yy, FUN=length)
+  zz$qM = qM
+  zz$n = zz1$N
+  for (i in 1:length(zz$iQ)) {
+    ff = yy$iQ==zz$iQ[i]
+    hh = boot(data.frame(N=yy$N[ff]), statistic=meanfun, R=rR)
+    tmp = as.double(quantile(hh$t, prob=c(0.025,0.975))) # replacement for boot.ci(), which sometimes does not work as intended
+    zz$N05[i] = tmp[1]
+    zz$N95[i] = tmp[2]
+  } 
+  return(zz)
+}
+```
+
+```{r readingNewDataOnce, eval=FALSE}
+# This chunk is only needed to produce the file resultsNew.rds
+# It collects the various data and merges them into one data.frame
+# which is then saved to the file resultsNew.rds
+# This is done to sped-up the reading of the data, there is no
+# need to perform the work done here every time this file is knitted
+
+ddPrio <- read_excel("./newData/isPrio.xlsx") # fid fid_2
+ddRA <- read_excel("./newData/isRoundabout.xlsx") 
+ddTS <- read_excel("./newData/isTrafficLight.xlsx") 
+
+mConv = function(xx) {
+  xx$fid_2 = ifelse(is.na(xx$fid_2),NA,1); return(xx)
+}
+ddP = mConv(ddPrio) 
+ddT = mConv(ddTS) 
+ddR = mConv(ddRA) 
+
+ddA = merge(ddP, ddR, by="fid", all=T)
+colnames(ddA) = c("fid", "nPr", "nRA")
+ddA = merge(ddA, ddT, by="fid", all=T)
+colnames(ddA) = c("fid", "nPr", "nRA", "nTS")
+
+ddA$cSum = apply(ddA[,2:4],1,mSum) # unfortunately, there are
+# entries here where cSum>1
+# table(ddA$cSum)
+indx = which(ddA$cSum==2)
+ddA$isCtrl = ifelse(ddA$cSum==0,"X","NA")
+ddA$isCtrl[ddA$nRA==1] = "RA"
+ddA$isCtrl[ddA$nPr==1] = "Prio"
+ddA$isCtrl[ddA$nTS==1] = "TS"
+# table(ddA$isCtrl, useNA = "ifany")
+#   Prio     RA     TS      X 
+#  43701   2602  36446 214863 
+
+# fid fid_2 -- however, there are many fid_2 for each fid
+# ddSVI <- read_excel("./newData/isStreetViewImage.xlsx") # slow
+
+# fid fid_2 landuse location
+ddLU <- read_excel("./newData/landuse.xlsx") 
+
+# no idea currently, how to deal with the landuse column in the data
+# maybe so?
+# f2nd = function(x) paste(x, sep=",")
+# lu = aggregate(landuse ~ fid, data = ddLU, FUN=f2nd)
+# location can be handled
+f1st = function(x) x[1]
+loc = aggregate(location ~ fid, data=ddLU, FUN = f1st, drop=FALSE)
+
+res = merge(ddA[,c(1,6)], loc,  by="fid", all=T)
+
+# fid fid_2 IstRad IstPKW IstFuss IstKrad IstGkfz IstSonstige
+ddN <- read_excel("./newData/numberAccidents.xlsx") 
+colnames(ddN) = c("fid","fid_2","isBike", "isCar", "isPed", "isMBike", "isTruck", "isMisc")
+ddN$isCrash = apply(ddN[,3:8],1,mSum)
+ddN$N = ifelse(ddN$isCrash>0, 1, 0)
+
+uu = aggregate(N ~ fid, data=ddN, FUN=mSum, drop=F)
+uuB = aggregate(isBike ~ fid, data=ddN, FUN=mSum, drop=F)
+
+uuA = merge(uu,uuB,by="fid", all=T)
+res = merge(res, uuA,  by="fid", all=T)
+res$isBike[is.na(res$isBike)] = 0
+
+# fid fid_2 - following colnames all start with 
+# NRW dtv data 2015_SVZ15_  -- then the rest
+# DTV05 DTV10 DTV15 DTVw15 DTVLV DTVwLV DTVSV DTVwSV DTVRad DTVKrad
+#  DTVLVm DTVBus DTVLoA DTVLZ DTVwRad DTVwKrad DTVwLVm DTVwBus 
+#   DTVwLoA DTVwLZ 
+ddQ <- read_excel("./newData/numberADT.xlsx")  # slow
+
+mmx = aggregate(`NRW dtv data 2015_SVZ15_DTV15` ~ fid, data=ddQ, FUN=mMax, drop=FALSE)
+colnames(mmx) = c("fid", "qCarMax")
+mmn = aggregate(`NRW dtv data 2015_SVZ15_DTV15` ~ fid, data=ddQ, FUN=mMin, drop=FALSE)
+colnames(mmn) = c("fid", "qCarMin")
+bb = aggregate(`NRW dtv data 2015_SVZ15_DTVRad` ~ fid, data=ddQ, FUN=mMax, drop=FALSE)
+colnames(bb) = c("fid", "qBike")
+
+result = merge(res, mmx, by="fid")  # this eliminates anything
+result = merge(result, bb, by="fid") # that is not in NWSIB
+result = merge(result, mmn, by="fid") 
+saveRDS(result, file="resultsNew.rds") # 75,784 lines
+```
+
+```{r}
+result = readRDS("resultsNew.rds")
+```
+
+Note: the latest text-version to this is on overleaf. The paper there contains small amendments to this Rmd, but the analysis and the Figures have not changed. 
+
+# Introduction
+
+Many means to organize intersections between roads are available, each of them having different operational characteristics when it comes to questions like safety, efficiency, or required space. Here, the concentration is on safety, and out of the many different intersection controls, this paper picks the following four (this selection is mainly based on availability): 
+
+* Without any organization, which in Germany comes down to right-before-left (will be named X in the following)
+* With priorization, where one road has priority over the other (named Prio)
+* Organized as a roundabout (named RA)
+* Controlled by a traffic signal (named TS).
+
+Common wisdom notes that with regard to traffic safety, a roundabout is the safest of these four -- which is one of the reasons for their usefulness, they mark a good compromise between safety and efficiency as long as the view is on cars only [@DanielsEtAl2008; @DanielsEtAl2009; @Jensen2017; @ElvikMeta2017].
+
+# The data used
+
+This research uses three main data-sources, all of them publicly available.
+
+* The German Accident Database (Unfallatlas -- GCDB) [@UnfallatlasDE],
+* The Northrhine Westfalia Road Traffic Database (NWSIB) [@Strassen.NRW],
+* The OpenStreetmap (OSM) database [@OSM2022]
+
+## The GCDB
+
+For each crash in Germany with injured people (the record starts in 2016, the latest year for which data are available is 2021), this database has the detailed location of the crash (in latitude/ longitude), some information about the time of the crash, the crash type, and the modes involved in it. The mode list contains bike, car, pedestrian, motorbike, truck, and an unidentified rest. 
+
+Note, that the crash data are optimized for privacy: some information has been left out by purpose, e.g. the detailed time of the crash, as well as the actual number of injured or killed people in each crash. The traffic mode is limited to 0 or 1, i.e. even a crash with two cars is noted only with a 1, not with a 2. For this investigation these omissions do not seem critical, this may change for other investigations. Altogether 46,953 crashes could be assigned to the study area that result from the NW road data-base. The crash-data are in the following denoted by the letter $N$.  
+
+## Openstreetmap (OSM)
+
+From the OSM database, all the intersections in the German federal state Northrhine-Westfalia (NW for short) have been extracted, resulting in about 281,729 intersections. They have been classified mostly from OSM itself, with additional input from another project where the roundabouts have been identified by separate means, see [@LeichEtAl2022]. 
+
+## NWSIB
+
+Not all of the OSM intersections had entries in the NWSIB data-base, and not all intersections in NWSIB had usable ADT values (denoted in the following by $Q_{\text{car}}, Q_{\text{bike}}$) or simply $Q$, so it comes down to a total of 59,635 intersections that had a more or less complete set of data. This holds for the car counts, the number of intersections that had ADT values for the bikes are a little bit smaller (59,044) and we think that the bike-data are less reliable. 
+
+# Analysing the data
+
+The different data-bases have been matched by creating a unique identifier from the OSM, and then assigning the information in the NWSIB and the crash database to the intersections from OSM. The road format of NWSIB is not compatible with OSM, so the assignment was done by matching all crashes and all ADT-values within a radius of 75m around the OSM intersections. Of the ADT-values, the maximum was taken, since it was not clear how the ADT-values have been assigned to the intersections in the NWSIB database. Taking the max avoids double-counting from vehicles that enter and leave an intersection.
+
+It has been observed, that some intersections had fairly large ADT-values, up-to 170,000 cars/day. While not impossible, it is very unlikely to have intersections with such a large demand in the data-set. Therefore, it was decided to eliminate the 1% of the data with the largest ADT-values with the exception of the RA, where it is thought that the $Q$-values are clean. In addition, the analysis below further restricts the modelling to ADT-values smaller than 65,000 veh/day since the data become very sparse for large ADT.
+
+For the analysis of the data, two approaches are being used: the first one is the standard approach in traffic safety research which works with generalized linear models (glm), and the second one is a data-driven approach.
+
+The second approach, which is especially useful when the data are plentiful, clusters the data in certain classes of $Q$ and computes separate statistics for each class, like the mean value. This in essence allows for a much more general relationship between the number of crashes and the exposition $Q$, which is not restricted to the type of models compatible with a glm.
+
+## Approach based on generalized linear models (glm)
+
+When modeling safety with a glm, it is assumed that the number of crashes can be described by a model of the type [@Hauer2004; @LordMannering2010; @HughesEtAl2015; @Ambros2018]:
+\begin{equation}
+\mu = \beta_0 Q^{\beta_1} \exp \left( \sum_{i \ge 2} \beta_i x_i \right )
+\label{eq:TSgen}
+\end{equation}
+
+Here, $\mu$ is the mean-value of the number of crashes $N$ (which is strictly speaking a rate, since it is crashes/time-interval, where one year is often used for the time-interval), the $Q$ is the exposition where often ADT is used, the number of cars per day, and the $x_i$ are various factors assumed to influence the crash-rate, such as the intersection organization, the position of the intersection (urban/rural) etc. The $\beta_i$ describe how strong each factor influences the crash-rate, and they are estimated from the available data. Note, that with respect to the exposition, a very specialized function is used, i.e. a power-law ($Q^\beta$ or $Q_1^{\beta_1} Q_2^{\beta_2}$ for two crossing streams with demand $Q_1, Q_2$). Also, the use of the exp()-function is debatable, especially when such a model is used to extrapolate and forecast. However, its use is difficult to avoid, it is a consequence of the fact that crash numbers are positive and the linear model is not for $\mu$ itself, but for the logarithm of the mean-value:
+\begin{equation}
+\log \mu = \beta_0 + \beta_1 \log Q + \sum_{i \ge 2} \beta_i x_i
+\label{eq:logTSgen}
+\end{equation}
+
+To complete this description, these mean values are the mean-values of a Poisson (P) or Negative Binomial (NB) distribution, in the following a NB has been used, which is also an observed fact in many, but not in all investigations. The difference between P and NB can be seen when looking at the relationship between mean $\mu$ and variance $\sigma^2$, which for the Poisson distribution is $\sigma^2 = \mu$, while for the NB it has over-dispersion:
+$$
+\sigma^2 = \mu + \mu^2/\theta
+$$
+where the parameter $\theta$ describes the deviation from the Poisson distribution: for $\theta \to \infty$, a Poisson distribution is retained. Here, the fit results yield $\theta = 1.13 \pm 0.02$, indicating a rather strong deviation from P.  
+
+In addition, the NB approach yields the  smaller AIC (139,000 versus 148,000), so it justifiable to assume that the data are NB-distributed.
+
+The actual R command to fit these data is given in the following line: 
+```{r displayCall, eval=FALSE, echo=TRUE}
+m <- glm.nb(N ~ isCtrl + isCtrl:I(log(Q)), data=mm)
+```
+
+```{r}
+rTS = subset(result, isCtrl=="TS" & !is.na(qCarMax))   # 10800 --> 1638
+rRA = subset(result, isCtrl=="RA" & !is.na(qCarMax))   # 3678 --> 3078
+rPrio = subset(result, isCtrl=="Prio" & !is.na(qCarMax)) # 42268 --> 37556
+rX = subset(result, isCtrl=="X" & !is.na(qCarMax)) # 214863 --> 17365
+
+qMxTS = quantile(rTS$qCarMax, prob=0.99)
+qMxPrio = quantile(rPrio$qCarMax, prob=0.99)
+qMxX = quantile(rX$qCarMax, prob=0.99)
+qMxRA = max(rRA$qCarMax) 
+
+# rPrio = subset(rTS, qCarMax < as.double(qMxPrio))
+rTS = subset(rTS, qCarMax < as.double(qMxTS))
+rX = subset(rX, qCarMax < as.double(qMxX))
+
+theData = rbind(rPrio, rTS, rRA, rX)
+
+m1Tst <- glm(N ~ isCtrl + isCtrl:I(log(qCarMax)), data=theData, family = "poisson")
+
+m2Tst <- glm.nb(N ~ isCtrl + isCtrl:I(log(qCarMax)), data=theData)
+
+# fortunately, not that different: made a mistake in the TRB-paper,
+# the filter for qMax was not set...
+m2Tst <- glm.nb(N ~ isCtrl + isCtrl:I(log(qCarMax)), data=subset(theData, qCarMax<qMx))
+```
+
+```{r additionalStuff, eval=F}
+# added after TRB submission
+theData$dQ = theData$qCarMax - theData$qCarMin
+mHSM <- glm.nb(N ~ isCtrl + isCtrl:I(log(qCarMax)) + isCtrl:I(log(qCarMin)), data=subset(theData, dQ>0))
+
+# the bike fits do not work at all, initially.
+# mBike <- glm.nb(isBike ~ isCtrl + isCtrl:I(log(qCarMax)) + isCtrl:I(log(qBike)), data=subset(theData, !is.na(qBike)))
+
+# qBike>0 is mandatory: there are 524 intersections where
+# qBike = 0, but isBike>0 ==> clearly, this will not work.
+bData = subset(theData, !is.na(qBike) & !is.na(isBike) & qBike>0)
+mBike <- glm.nb(isBike ~ isCtrl + isCtrl:I(log(qCarMax)) + isCtrl:I(log(qBike)), data=bData)
+
+# Since the bike-fits haven't worked in the beginning, I 
+# switched to the data-driven approach, and this one worked
+
+nI = 13
+aTS = myAggG(rTS$qBike, rTS$isBike, nInt=nI, qMax=qMx) 
+aRA = myAggG(rRA$qBike, rRA$isBike, nInt=nI, qMax=qMx) 
+
+nI = 15
+aPrio = myAggG(rPrio$qBike, rPrio$isBike, nInt=nI, qMax=qMx)
+aX = myAggG(rX$qBike, rX$isBike, nInt=nI, qMax=qMx)
+
+dx = cbind(aTS$qM, aRA$qM)
+dy = cbind(aTS$N, aRA$N)
+
+# different number of bins
+dx1 = cbind(aPrio$qM, aX$qM) 
+dy1 = cbind(aPrio$N, aX$N)
+
+par(mar=c(4,4,1,1), las=1)
+matplot(dx, dy, type="o", pch=16, lty=1, lwd=3, xlab=expression(Q[bike]), ylab="N", col=1:2,ylim=c(0,1))
+matlines(dx1, dy1, type="o", pch=16, lty=1, lwd=3, col=3:4)
+legend(x="topleft", legend=c("TS","RA","Prio","X"), lwd=3, col=1:4, ncol=2)
+
+```
+
+
+```{r, eval=FALSE}
+# the issue with qBike: they are too small:
+m = lm(qBike ~ qCarMax + 0, data=bData) # yields 0.011 as slope
+# I think the bike share is somewhat larger than this
+# In principle, one may use MID data to fix this a bit
+bShare = bData$qBike/bData$qCarMax
+pbS = density(bShare, from=0,to=0.08) # mode at 0.0014 (!)
+plot(pbS)
+```
+
+This results in the following set of parameters:
+
+```{r}
+s = summary(m2Tst)
+m = coef(s)
+knitr::kable(m, format="latex", position="!h", caption="The result of the model specified above to fit the crash-numbers versus ADT, for the four intersection controls.", digits=3, booktabs = TRUE)
+```
+
+A graphical display of this is shown in Figure \ref{fig:glm}, where the crash numbers $N$ are displayed as a function of the demand $Q_{\text{car}}$ for the four intersection controls. All nine fitting parameters (two for each of the four curves $\beta_{0i} Q^{\beta_{1i}}$, and one for $\theta$) are highly significant, eight have probabilities ($p$-values) smaller than $p < 2 \cdot 10^{-5}$, with the worst fit is for the parameter $\beta_{0i}$ of the RA, which has $p=0.014$.  All the exponents are smaller than one $\beta_{\text{Prio,RA,TS,X}} = (0.82,0.69,0.66,0.68)$, and they are very similar to each other.  
+
+
+```{r glmApproach, fig.cap = "The result of the glm fit\\label{fig:glm}. Shown are some of the data, and the four curves that result from the fit for the four intersection organizations.", out.width='100%'}
+# plotting the points is slow
+# interact_plot(m1Tst, pred=qCarMax, modx=isCtrl, data=theData, plot.points = T, interval=T) + ylim(0,10)
+# glm.nb() has much wider bands
+qCarTxt = expression(paste(Q[car]))
+#interact_plot(m2Tst, pred=qCarMax, modx=isCtrl, data=theData, plot.points = F, interval=T) + xlab(qCarTxt)
+cols = c("green2", "red", "black", "blue")
+#interact_plot(m2Tst, pred=qCarMax, modx=isCtrl, data=theData, plot.points = F, interval=T, colors=cols) + xlab(qCarTxt)
+
+interact_plot(m2Tst, pred=qCarMax, modx=isCtrl, data=theData, plot.points = T, point.size=1.5, point.alpha=0.1, interval=T, vary.lty=F, line.thickness = 1.5, colors=cols) + ylim(0,7) + xlab(qCarTxt)
+```
+
+
+## A data-driven approach
+
+A data-driven approach does not make many assumptions like the model in Equation (\ref{eq:TSgen}). It simply aggregates the data into bins of similar ADT-values, where the bin-width has been chosen so, that each bin contains roughly the same number of data-points. Clearly, other choices are possible and valid as well, doing this quantile-based approach has the advantage to produce similar statistics in each bin, at the expanse of the bin-width. Within each bin, a number of statistical metrics could be computed, for simplicity, the mean value is chosen here. The result is shown in Figure \ref{fig:ddA}. While the general form of the relationship between $N$ and $Q$ is roughly the same (as it should), a number of interesting differences could be seen. 
+
+First of all, this approach makes it much clearer where there are actually real data, and where extrapolation is applied; this is even more visible in Figure \ref{fig:ddAB}, where this approach is compared directly with the glm-ansatz.
+
+As before, there is only a small difference in safety between a priority-controled intersection, and a round-about. The unregulated intersections are the safest, and the intersections controlled by traffic signals display the lowest level of safety. We think that these results will have to be modified once a more thorough quality control of the input data is established. 
+
+What is also interesting is that at least the curve for the unregulated intersections (and partially the one for the signalized intersections as well) have a very interesting behavior that is not compatible with the power-law assumption of Equation (\ref{eq:TSgen}): for large demand the number of crashes seem to saturate. This is not in line with most results; the power-law approach yields ever-increasing crash-numbers with demand, even for small values of the exponent $\beta$. However, we have seen such a behavior in other investigations [@WagnerEtAl2021]. It might be due to the fact, that a large demand may slow vehicles down, and this would at least cut the number of crashes with injured persons. However, the very details of such a mechanism depend on the layout and design of each intersection, so additional investigations are needed to clarify this.
+
+However, note that the quality of the data presented here is not overwhelming, so these results are not that reliable. However, it demonstrates, that some care has to be taken with forcing models too strongly onto data, one may in fact be suspicious that the approach with Equation (\ref{eq:TSgen}) which is ubiquitous in traffic safety research may lead to the overlooking of some features of real data.
+
+```{r preparingPlots}
+nI = 17
+aTS = myAgg(rTS, nInt=nI, qMax=qMx)
+aRA = myAgg(rRA, nInt=nI, qMax=qMx)
+
+aPrio = myAgg(rPrio, nInt=31, qMax=qMx)
+aX = myAgg(rX, nInt=31, qMax=qMx)
+
+dx = cbind(aTS$qM, aRA$qM)
+dy = cbind(aTS$N, aRA$N)
+
+# different number of bins
+dx1 = cbind(aPrio$qM, aX$qM) 
+dy1 = cbind(aPrio$N, aX$N)
+
+mPrio <- glm.nb(N ~ I(log(qCarMax)), data=rPrio)
+mRA <- glm.nb(N ~ I(log(qCarMax)), data=rRA)
+mTS <- glm.nb(N ~ I(log(qCarMax)), data=rTS)
+mX <- glm.nb(N ~ I(log(qCarMax)), data=rX)
+```
+
+
+```{r ddApproach, fig.cap = "The result of the data-driven approach\\label{fig:ddA}. Again, there are four lines for the four intersection controls.", out.width='100%'}
+par(mar=c(4,4,1,1), las=1)
+matplot(dx, dy, type="o", pch=16, lty=1, lwd=3, xlab=expression(Q[car]), ylab="N", col=1:2,ylim=c(0,3))
+matlines(dx1, dy1, type="o", pch=16, lty=1, lwd=3, col=3:4)
+
+legend(x="topleft", legend=c("TS","RA","Prio","X"), lwd=3, col=1:4, ncol=2)
+```
+
+It is possible to dig a bit deeper into these data by directly comparing the data-driven approach with the glm-results. The result is shown in Figure \ref{fig:ddAB}, where the data-driven relationships have been decorated with the confidence intervals (level 0.95) of the mean-values. These have been computed by a boot-strapping approach, and the results have been put into a co-ordinate frame where the $x$- and the $y$-axis have a logarithmic scaling: this zooms in on the small values in $x$ and $y$, and it transforms the glm-fits into straight lines. As mentioned already, this also makes it quite easy to see where the glm does an extrapolation. 
+
+```{r}
+# Want to use bootstraping to compute the 95% confidence 
+# intervals of the various mean-values in the plot above
+
+# a small example of R's boot library which is a bit
+# cumbersome to use, as so often in R...
+#cc = data.frame(N=rpois(100,5))
+meanfun <- function(data, i){d <- data[i, ]; return(mean(d,na.rm=T))}
+#bo <- boot(cc[, "N", drop = FALSE], statistic=meanfun, R=500)
+#boot.ci(bo, conf=0.95, type="bca")
+
+myAggB = function(rY, nInt=11, qMax=1e6, rR=200) {
+  yy = subset(rY, qCarMax<qMax)
+  iQ = quantile(yy$qCarMax, prob=seq(0,1,length.out=nInt), na.rm=T)
+  yy$iQ = cut(yy$qCarMax, breaks=iQ)
+  ll = levels(yy$iQ)
+  qM = 0.5*(iQ[1:(nInt-1)] + iQ[2:nInt])
+  zz = aggregate(N ~ iQ, data=yy, FUN=mean)
+  zz1 = aggregate(N ~ iQ, data=yy, FUN=length)
+  zz$qM = qM
+  zz$n = zz1$N
+  for (i in 1:length(zz$iQ)) {
+    ff = yy$iQ==zz$iQ[i]
+    hh = boot(data.frame(N=yy$N[ff]), statistic=meanfun, R=rR)
+    tmp = as.double(quantile(hh$t, prob=c(0.025,0.975))) # replacement for boot.ci(), which sometimes does not work as intended
+    zz$N05[i] = tmp[1]
+    zz$N95[i] = tmp[2]
+  } 
+  return(zz)
+}
+
+a1RA = myAggB(rRA, nInt=12)
+a1TS = myAggB(rTS, nInt=21)
+a1X = myAggB(rX, nInt=23)
+a1Prio = myAggB(rPrio, nInt=41)
+```
+
+```{r ddBoot, fig.cap = "The result of the data-driven approach\\label{fig:ddAB} with boot-straped confidence intervals, compared against the glm-fits.", out.width='100%'}
+
+qCarTxt = expression(paste(Q[car]))
+
+# need different format to plot it in a simplified manner 
+# in ggplot:
+b1 = a1X; b1$isCtrl = "X"
+b2 = a1Prio; b2$isCtrl = "Prio"
+b3 = a1RA; b3$isCtrl = "RA"
+b4 = a1TS; b4$isCtrl = "TS"
+aa = rbind(b1, b2, b3, b4) 
+
+# cols = c("black", "red", "green", "blue") # ggplot() order alphabetically:
+cols = c("green2", "red", "black", "blue")
+
+h = ggplot(aa, aes(x = qM, y = N, color = isCtrl)) + geom_ribbon(aes(ymin=N05,ymax=N95, fill =isCtrl), alpha=0.2) + scale_fill_manual(values=cols) + geom_line(lwd=1) +  scale_color_manual(values = cols) + xlab(qCarTxt)
+
+h1 = h + stat_function(fun=function(x) exp(coef(mTS)[1] + coef(mTS)[2]*log(x)), col="black", lwd=1.25, lty=2) +  
+stat_function(fun=function(x) exp(coef(mPrio)[1] + coef(mPrio)[2]*log(x)), col="green", lwd=1.25, lty=2) +  
+stat_function(fun=function(x) exp(coef(mRA)[1] + coef(mRA)[2]*log(x)), col="red", lwd=1.25, lty=2) +  
+stat_function(fun=function(x) exp(coef(mX)[1] + coef(mX)[2]*log(x)), col="blue", lwd=1.25, lty=2)
+h2 = h1 + theme(legend.position = c(0.1,0.85)) # must be in screen coordinates
+h2 + scale_y_log10() + scale_x_log10()
+```
+
+```{r oldplot, eval=F}
+h <- ggplot(a1X, aes(qM, N)) + geom_ribbon(aes(ymin=N05,ymax=N95),fill="blue",alpha=0.25) + geom_line(aes(y=N), col="blue", lwd=2) + geom_point(pch=16,col="orange") + xlab(qCarTxt) + geom_ribbon(data=a1TS,aes(ymin=N05,ymax=N95),fill="grey75",alpha=0.4) +
+geom_line(data=a1TS, aes(qM,N), col="black", lwd=2) + geom_point(data=a1TS, aes(qM,N), pch=16,col="green") + geom_ribbon(data=a1Prio,aes(ymin=N05,ymax=N95),fill="green", alpha=0.25) +
+geom_line(data=a1Prio, aes(qM,N), col="green", lwd=2) + geom_point(data=a1Prio, aes(qM,N), pch=16,col="red") + geom_ribbon(data=a1RA,aes(ymin=N05,ymax=N95),fill="red", alpha=0.25) +
+geom_line(data=a1RA, aes(qM,N), col="red", lwd=2) + geom_point(data=a1RA, aes(qM,N), pch=16, col="white")
+# h
+
+h1 <- h + stat_function(fun=function(x) exp(coef(mTS)[1] + coef(mTS)[2]*log(x)), col="black", lwd=1.25, lty=2) +  
+stat_function(fun=function(x) exp(coef(mPrio)[1] + coef(mPrio)[2]*log(x)), col="green", lwd=1.25, lty=2) +  
+stat_function(fun=function(x) exp(coef(mRA)[1] + coef(mRA)[2]*log(x)), col="red", lwd=1.25, lty=2) +  
+stat_function(fun=function(x) exp(coef(mX)[1] + coef(mX)[2]*log(x)), col="blue", lwd=1.25, lty=2)
+
+#h2 <- h1 + scale_y_sqrt(limits=c(0,4), expand = c(0, 0), breaks=c(0,1,2,4)) + scale_x_sqrt(limits=c(0,50000), expand = c(0, 0), breaks=c(0,5000,10000,30000,45000))
+#h2
+
+h3 <- h1 + scale_y_log10() + scale_x_log10()
+h3
+
+# legend
+# position
+# theme(legend.position = c(10000, 0.1), legend.title = "isCtrl", legend.text)
+#        legend.background = element_rect(fill = "white")) 
+# scale_color_manual(name='isCtrl',
+#                     breaks=c('X', 'Prio', 'RA', 'TS'),
+#                     values=c('X'='blue', 'Prio'='green', #'RA'='red', 'TS'='black'))
+
+
+```
+
+This direct comparison seems a bit clearer about the tendency to a saturation of the crash-numbers for large demand. In addition, especially for the uncontrolled intersection organization, the increase for the small demands differs from the power-law significantly. This might be the point where the privacy restrictions of the GCDB is hindering more insights: one may speculate, that this comes from a larger amount of single vehicle crashes, and this number may increase linearly with $Q$, and therefore with a larger exponent than $\beta_{\text{X}}=0.86$. 
+
+Also, it is nice to see that roundabouts and traffic signals are typically placed only on intersections with a larger demand, in line with German regulations.
+
+# Conclusions
+
+The short approach described here demonstrates the possibilities, but also the weaknesses of an approach that tries to use large data-bases of road safety data. One of the challenges is clearly to have some kind of quality control of the data, which is lacking here. Nevertheless, the approach can partly reproduce some features that are known already, however it also demonstrates that with more data, and with an analysis approach that is not too strongly constrained by assumed relationships between the crash-numbers and the exposition, more and better information could be unearthed. This may lead to a better understanding of traffic safety and the factors that may decrease it, and ultimately to safer roads as well. 
+
+# Bibliography
+
+
